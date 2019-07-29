@@ -1,0 +1,145 @@
+#! /bin/bash
+#  script to output the first fixed software version from Red Hat
+#  for the provided RHEL version (5, 6, 7) and CVE or CVE list separated by spaces
+#  Also attempts to grab CVSS and DoS info, because PCI
+
+if [ $# -lt 2 ]; then
+	echo Script usage is './rhel <Red Hat Version> <CVE(s)>'
+	exit 1
+fi
+
+VERSION=$1
+for CVE in "$@"
+do
+	if [[ $CVE == $1 ]]; then
+		continue	# lazy way to skip the provided version, used above
+	else
+		echo "$CVE fixed in version:"
+
+		# wget creates file curlOut before deleting it after running
+		# deletion can be removed for troubleshooting purposes
+		wget -O curlOut --quiet "https://access.redhat.com/security/cve/$CVE"
+
+		# Assign common service type to SERVICE variable
+		grep -i "openssl" -q curlOut
+		if [ $? == 0 ]; then
+			SERVICE=openssl
+		else
+			grep -i "openssh" -q curlOut
+			if [ $? == 0 ]; then
+				SERVICE=openssh
+			else
+				grep -i "php" -q curlOut
+				if [ $? == 0 ]; then
+					SERVICE=php
+				else
+					grep -i "postfix" -q curlOut
+					if [ $? == 0 ]; then      
+						SERVICE=postfix
+					else
+						SERVICE=httpd
+					fi
+				fi
+			fi
+		fi
+
+		RHSA=`grep "Linux $VERSION ($SERVICE)" -A2 curlOut | grep RHSA | cut -d '"' -f 2 | cut -d '/' -f 5`
+		grep "Linux $VERSION ($SERVICE)" -A2 curlOut | grep -q RHSA
+
+		# Check if there's an RHSA - if so, get fixed version, else output affected/unaffected
+		if [ $? == 0 ]; then
+			# file gets deleted later
+			wget -O curlOut2 --quiet "https://access.redhat.com/errata/$RHSA"
+
+			case $SERVICE in
+				"httpd")  grep --color -m 1 "httpd-2.*x86_64.rpm$" curlOut2
+				;;
+				"openssh")  grep --color -m 1 "openssh-.*x86_64.rpm$" curlOut2
+				;;
+				"php")  grep --color -m 1 "php-.*x86_64.rpm$" curlOut2
+				;;
+				"postfix")  grep --color -m 1 "postfix-.*x86_64.rpm$" curlOut2
+				;;
+				"openssl")  grep --color -m 1 "openssl-1.*x86_64.rpm$" curlOut2
+				;;
+				*)  echo You are on your own, good luck!
+				exit 2
+				;;
+			esac
+
+			rm curlOut2
+		else
+			grep "Not vulnerable. This issue did not affect" -q curlOut
+			if [ $? == 0 ]; then
+				grep "Not vulnerable. This issue did not affect" curlOut | cut -d ">" -f 2 | cut -d "<" -f 1
+				rm curlOut
+				continue
+			fi
+			case $SERVICE in
+				"httpd")  grep "Linux $VERSION<" -A3 curlOut | grep "state" | cut -d ">" -f 2 | cut -d "<" -f 1
+				;;
+				"openssh")  grep "Linux $VERSION<" -A3 curlOut | grep ">openssh<" -1 | grep "state" | cut -d ">" -f 2 | cut -d "<" -f 1
+				;;
+				"php")  grep "Linux $VERSION<" -A3 curlOut | grep ">php<" -1 | grep "state" | cut -d ">" -f 2 | cut -d "<" -f 1
+				;;
+				"postfix")  grep "Linux $VERSION<" -A3 curlOut | grep ">postfix<" -1 | grep "state" | cut -d ">" -f 2 | cut -d "<" -f 1
+				;;
+				"openssl")  grep "Linux $VERSION<" -A3 curlOut | grep ">openssl<" -1 | grep "state" | cut -d ">" -f 2 | cut -d "<" -f 1
+				;;
+				*)  echo You are on your own, good luck!
+				exit 3
+				;;
+			esac
+		fi
+
+		# try to get CVSS info
+		CVSSVTWO=$(grep -i 'cvss v2' -A7 curlOut | grep -i 'th-base-score">' -A1 | grep '/td>' | cut -d '<' -f 1 | awk '{$1=$1};1')
+
+		if [ -z "$CVSSVTWO" ]; then
+			CVSSVTHREE=$(grep -i 'cvss v3' -A7 curlOut | grep -i 'th-base-score">' -A1 | grep '/td>' | cut -d '<' -f 1 | awk '{$1=$1};1')
+			if [ -z "$CVSSVTHREE" ]; then
+				NV=$(grep 'Not vulnerable.' curlOut)
+				if [ -z "$NV" ]; then
+					echo NEI: Please visit https://access.redhat.com/security/cve/$CVE
+				else
+					echo Not Vulnerable
+				fi
+			else
+				echo CVSS v3 is $CVSSVTHREE
+
+				CONFID=$(grep -i 'confidentiality">' curlOut -A1 | grep '/td' | cut -d '<' -f1 | awk '{$1=$1};1')
+				if [ -z "$CONFID" ]; then
+					echo Could not find confidentiality data
+				else
+					echo Conf: $CONFID
+				fi
+
+				INTEG=$(grep -i 'grity-impact">' curlOut -A1 | grep '/td' | cut -d '<' -f1 | awk '{$1=$1};1')
+				if [ -z "$INTEG" ]; then
+					echo Could not find integrity data
+				else
+					echo Intg: $INTEG
+				fi
+			fi
+		else
+			echo CVSS v2 is $CVSSVTWO
+
+			CONFID=$(grep 'Confidentiality Impact' curlOut -A2 | grep '/td' | cut -d '<' -f1 | awk '{$1=$1};1')
+			if [ -z "$CONFID" ]; then
+				echo Could not find confidentiality data
+			else
+				echo Conf: $CONFID
+			fi
+
+			INTEG=$(grep -i 'confidentiality impact' -A8 curlOut | grep 'Integrity Impact' -A2 | grep '/td' | cut -d '<' -f1 | awk '{$1=$1};1')
+			if [ -z "$INTEG" ]; then
+				echo Could not find integrity data
+			else
+				echo Intg: $INTEG
+			fi
+		fi
+
+		echo ""
+	fi
+	rm curlOut
+done
